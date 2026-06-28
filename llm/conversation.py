@@ -1,7 +1,8 @@
 import time
 
-from core.state import Action, MotivationalState
 from core.actions import execution_instruction, normalize_action_id
+from core.config import G_IND, G_TRANS
+from core.state import Action, MotivationalState
 from dotenv import load_dotenv
 
 RETRYABLE_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "HIGH DEMAND")
@@ -42,24 +43,36 @@ class MetaMoChatAssistant:
         self.client = None
         self.chat = None
 
-    def generate_final_response(self, user_text: str, chosen_action: Action, current_state: MotivationalState) -> str:
+    def generate_final_response(
+        self,
+        user_text: str,
+        chosen_action: Action,
+        current_state: MotivationalState,
+        inference_instructions: str | None = None,
+    ) -> str:
         """
         Execute the chosen action by mapping it to an explicit behavioral instruction.
         """
         action_id = normalize_action_id(chosen_action.id)
+        inference_directive = inference_instructions or "No additional internal reasoning task was selected."
         execution_prompt = f"""
         USER MESSAGE: "{user_text}"
 
         INTERNAL METAMO DIRECTIVE:
         Selected action: "{action_id}"
-        Current Individuation (Caution) level: {current_state.G[0]:.2f}
-        Current Transcendence (Curiosity) level: {current_state.G[1]:.2f}
+        Current Individuation (Caution) level: {current_state.G[G_IND]:.2f}
+        Current Transcendence (Curiosity) level: {current_state.G[G_TRANS]:.2f}
 
         ACTION INSTRUCTION:
         {execution_instruction(action_id)}
 
+        INTERNAL MOTIVATION-DRIVEN INFERENCE PLAN:
+        {inference_directive}
+
         INSTRUCTION:
-        Respond naturally to the USER MESSAGE, but follow the ACTION INSTRUCTION exactly.
+        Before answering, follow the INTERNAL MOTIVATION-DRIVEN INFERENCE PLAN as your reasoning
+        control policy. Then respond naturally to the USER MESSAGE while following the ACTION
+        INSTRUCTION exactly. Do not expose the internal plan unless the user explicitly asks for it.
         """
 
         for attempt in range(3):
