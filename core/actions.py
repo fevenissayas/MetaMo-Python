@@ -49,8 +49,8 @@ class ActionProfile:
 
 ACTION_SPECS: Final[dict[str, ActionSpec]] = {
     "safe_answer": ActionSpec(
-        planning="Give a careful, grounded answer using only well-supported claims.",
-        execution="Answer cautiously, stick to supported facts, and avoid speculation.",
+        planning="Answer direct informational questions, define concepts, and explain grounded claims carefully.",
+        execution="Answer directly, stick to supported facts, and avoid speculation.",
         mode="stabilizing",
         dominant_goals=(G_HELP,),
         supporting_goals=(G_ETHIC,),
@@ -142,7 +142,7 @@ def _goal_alignment(spec: ActionSpec) -> tuple[float, ...]:
     return tuple(float(v) for v in np.clip(correlations, -1.0, 1.0))
 
 
-def _derive_action_profile(spec: ActionSpec) -> ActionProfile:
+def derive_action_profile(spec: ActionSpec) -> ActionProfile:
     mode = MODE_PROFILES[spec.mode]
     return ActionProfile(
         goal_correlations=_goal_alignment(spec),
@@ -151,7 +151,7 @@ def _derive_action_profile(spec: ActionSpec) -> ActionProfile:
 
 
 ACTION_PROFILES: Final[dict[str, ActionProfile]] = {
-    action_id: _derive_action_profile(spec)
+    action_id: derive_action_profile(spec)
     for action_id, spec in ACTION_SPECS.items()
 }
 
