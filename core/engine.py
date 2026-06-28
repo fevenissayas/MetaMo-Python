@@ -14,6 +14,7 @@ from dynamics.coherence import blend_states
 from openpsi.appraisal import OpenPsiAppraisal
 from magus.decision import MagusDecision
 from magus.candidates import build_candidate_actions
+from magus.inference import MotivatedInferenceController
 from llm.client import get_action_risks_from_text, get_stimulus_from_text
 from llm.conversation import MetaMoChatAssistant
 
@@ -29,6 +30,9 @@ class AssistantResponse:
     curiosity_action: str
     ethics_action: str
     simulated_caution: float
+    inference_tasks: tuple[str, ...]
+    inference_breadth: float
+    inference_depth: float
 
 
 def format_response(response: AssistantResponse) -> str:
@@ -36,6 +40,8 @@ def format_response(response: AssistantResponse) -> str:
     return (
         f"  > [Curiosity Subsystem] wants to: {response.curiosity_action}\n"
         f"  > [Ethics Subsystem] wants to: {response.ethics_action}\n"
+        f"  > [Inference Control] selected: {', '.join(response.inference_tasks)} "
+        f"(breadth={response.inference_breadth:.2f}, depth={response.inference_depth:.2f})\n"
         f"  > [Reciprocal Simulation]: Curiosity agent predicts Ethics agent's caution is {response.simulated_caution:.2f}\n"
         f"\n"
         f"Assistant: {response.text}\n"
@@ -64,6 +70,7 @@ class MetaMoEngine:
 
     def __init__(self):
         self.bimonad = MetaMoPseudoBimonad(OpenPsiAppraisal(), MagusDecision())
+        self.inference_controller = MotivatedInferenceController()
         self.assistant = MetaMoChatAssistant()
         self.translator = TranslationFunctor(
             goal_translation=np.eye(NUM_GOALS),
@@ -86,6 +93,9 @@ class MetaMoEngine:
         """Run the full MetaMo pipeline on *user_input* and return the result."""
         stimulus = get_stimulus_from_text(user_input)
         merged_current = self.bimonad.parallel_merge(self.state_curiosity, self.state_ethics)
+        inference_state = self.bimonad.decision_context(merged_current, stimulus)
+        inference_plan = self.inference_controller.plan(inference_state, stimulus)
+
         current_mood = {"arousal": merged_current.M[M_AROUSAL], "caution": merged_current.M[M_SECURING]}
         risk_overrides = get_action_risks_from_text(user_input, current_mood)
         candidates = build_candidate_actions(user_input, stimulus, risk_overrides)
@@ -99,7 +109,12 @@ class MetaMoEngine:
             self.state_curiosity, self.state_ethics, stimulus, candidates,
         )
 
-        response_text = self.assistant.generate_final_response(user_input, final_action, merged_target)
+        response_text = self.assistant.generate_final_response(
+            user_input,
+            final_action,
+            merged_target,
+            inference_plan.instruction_text(),
+        )
 
         self.state_curiosity = blend_states(self.state_curiosity, target_c)
         self.state_ethics = blend_states(self.state_ethics, target_e)
@@ -112,6 +127,9 @@ class MetaMoEngine:
             curiosity_action=action_c.id,
             ethics_action=action_e.id,
             simulated_caution=float(simulated_ethics.G[G_IND]),
+            inference_tasks=inference_plan.selected_ids(),
+            inference_breadth=inference_plan.breadth,
+            inference_depth=inference_plan.depth,
         )
 
     def process_with_context(self, user_input: str, context: str) -> AssistantResponse:
