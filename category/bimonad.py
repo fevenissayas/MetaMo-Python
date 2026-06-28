@@ -1,6 +1,5 @@
 from typing import List, Tuple
 import numpy as np
-# Assuming these are available in your python path
 from core.state import MotivationalState, Stimulus, Action
 from core.config import (
     G_ETHIC,
@@ -74,6 +73,12 @@ class MetaMoPseudoBimonad:
         """
         appraised_state = self.appraisal.appraise(state, stimulus)
         return raise_boundary_caution(appraised_state)
+
+    def decision_context(self, state: MotivationalState, stimulus: Stimulus) -> MotivationalState:
+        """
+        Public post-appraisal state used by decision and inference-control callers.
+        """
+        return self._decision_context(state, stimulus)
 
     def _local_reference_state(self, state: MotivationalState, next_state: MotivationalState) -> MotivationalState:
         """
