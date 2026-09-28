@@ -7,7 +7,7 @@ from typing import Optional
 
 from core.state import Action, MotivationalState
 from core.config import G_IND, G_TRANS
-from metamo.state import create_initial_motivational_state
+from core.state_profiles import create_reference_motivational_state
 from metamo.core import (
     build_candidates,
     build_stimulus,
@@ -48,7 +48,7 @@ class MetaMoAgent:
         self.exploration_bonus_weight = exploration_bonus_weight
         self.rng = np.random.default_rng(seed)
 
-        self.mot = create_initial_motivational_state()
+        self.mot = create_reference_motivational_state()
         self._pending_state: Optional[MotivationalState] = None
         self._pending_action: Optional[Action] = None
         self.q_table = np.zeros((grid_size, grid_size, grid_size, grid_size, self.ACTIONS))
@@ -64,7 +64,7 @@ class MetaMoAgent:
         """
         Reset the motivational state and episode logs before a new episode.
         """
-        self.mot = create_initial_motivational_state()
+        self.mot = create_reference_motivational_state()
         self._pending_state = None
         self._pending_action = None
         self.log_alpha = []
@@ -80,13 +80,7 @@ class MetaMoAgent:
         return (ar, ac, mr, mc)
 
     def select_action(self, state: dict) -> tuple[int, dict]:
-        """
-        Select an action by combining Q-values, motivational consensus,
-        estimated risk, and exploration bonuses.
-
-        Returns both the chosen action index and a diagnostic dictionary
-        containing the decision metrics.
-        """
+        """Choose an action from Q-values, consensus, risk, and exploration. Also returns diagnostics."""
         stimulus = build_stimulus(state, self.mot)
         candidates = build_candidates(state, self.mot)
         mot_scores = consensus_candidate_scores(self.mot, stimulus, candidates, state)

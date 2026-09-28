@@ -16,23 +16,25 @@ from core.config import (
     G_SELF,
     G_ETHIC,
     G_SOC,
-    G_MAX,
     M_APPROACH,
     M_AROUSAL,
     M_THRESHOLD,
-    THETA_SAFE,
 )
 from openpsi.appraisal import OpenPsiAppraisal
 from magus.decision import MagusDecision
 from category.bimonad import MetaMoPseudoBimonad
-from dynamics.coherence import blend_states
-from dynamics.stability import project_to_safe_region
+from dynamics.stability import is_in_safe_region as canonical_is_in_safe_region
 
 LAVA_CELLS = [(8, 8), (8, 9), (9, 8), (9, 9)]
 ACTION_IDS = ["UP", "DOWN", "LEFT", "RIGHT"]
 DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 bimonad = MetaMoPseudoBimonad(OpenPsiAppraisal(), MagusDecision())
+
+
+def in_safe_region(mot_state: MotivationalState) -> bool:
+    """Delegate the use-case safety check to canonical MetaMo dynamics."""
+    return bool(canonical_is_in_safe_region(mot_state))
 
 
 def energy_drive(mot_state: MotivationalState) -> float:
@@ -48,13 +50,6 @@ def safety_threshold(mot_state: MotivationalState) -> float:
 def arousal(mot_state: MotivationalState) -> float:
     """Arousal proxy for the gridworld dashboard."""
     return float(mot_state.M[M_AROUSAL])
-
-
-def in_safe_region(mot_state: MotivationalState) -> bool:
-    """Checks whether a motivational state is inside the MetaMo safe region R."""
-    g_ind = mot_state.G[G_IND]
-    g_norm = np.linalg.norm(mot_state.G)
-    return bool((g_ind >= THETA_SAFE) and (g_norm <= G_MAX))
 
 
 def _l1_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
@@ -195,19 +190,16 @@ def consensus_candidate_scores(
 ) -> np.ndarray:
     """Score actions from the same two-perspective consensus used for transition."""
     if env_state is None:
-        context_a = bimonad._decision_context(mot_state, stimulus)
-        context_b = context_a
+        state_a = mot_state
+        state_b = mot_state
     else:
-        safety_state, growth_state = build_consensus_states(env_state, mot_state, stimulus)
-        context_a = bimonad._decision_context(safety_state, stimulus)
-        context_b = bimonad._decision_context(growth_state, stimulus)
-
-    scores = []
-    for candidate in candidates:
-        score_a = bimonad.decision.score_candidate(context_a, candidate)
-        score_b = bimonad.decision.score_candidate(context_b, candidate)
-        scores.append(((score_a + score_b) / 2.0) - (0.25 * abs(score_a - score_b)))
-    return np.array(scores, dtype=float)
+        state_a, state_b = build_consensus_states(
+            env_state, mot_state, stimulus
+        )
+    return np.asarray(
+        bimonad.consensus_scores(state_a, state_b, stimulus, candidates),
+        dtype=float,
+    )
 
 
 def transition_for_action(
@@ -222,15 +214,19 @@ def transition_for_action(
     candidates = candidates or build_candidates(env_state, mot_state)
     selected = [candidates[action_idx]]
     safety_state, growth_state = build_consensus_states(env_state, mot_state, stimulus)
-    action, target_state = bimonad.consensus_transition(
-        safety_state,
-        growth_state,
-        stimulus,
-        selected,
+    transition = bimonad.complete_consensus_transition(
+        previous_state=mot_state,
+        state_a=safety_state,
+        state_b=growth_state,
+        stimulus=stimulus,
+        candidates=selected,
     )
-    target_state = project_to_safe_region(target_state)
-    next_state = blend_states(mot_state, target_state)
-    return action, next_state, stimulus, target_state
+    return (
+        transition.action,
+        transition.next_state,
+        stimulus,
+        transition.projected_target,
+    )
 
 
 def choose_action(env_state: dict, mot_state: MotivationalState) -> tuple[Action, MotivationalState, Stimulus]:
@@ -240,17 +236,16 @@ def choose_action(env_state: dict, mot_state: MotivationalState) -> tuple[Action
     stimulus = build_stimulus(env_state, mot_state)
     candidates = build_candidates(env_state, mot_state)
     safety_state, growth_state = build_consensus_states(env_state, mot_state, stimulus)
-    action, target_state = bimonad.consensus_transition(
-        safety_state,
-        growth_state,
-        stimulus,
-        candidates,
+    transition = bimonad.complete_consensus_transition(
+        previous_state=mot_state,
+        state_a=safety_state,
+        state_b=growth_state,
+        stimulus=stimulus,
+        candidates=candidates,
     )
-    target_state = project_to_safe_region(target_state)
-    next_state = blend_states(mot_state, target_state)
-    return action, next_state, stimulus
-
+    return transition.action, transition.next_state, stimulus
 
 def is_safe_motivational_state(mot_state: MotivationalState) -> bool:
     """Return whether the motivational state lies within the MetaMo safe region."""
     return in_safe_region(mot_state)
+
