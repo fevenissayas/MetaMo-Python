@@ -1,3 +1,6 @@
 numpy
 pygame
 matplotlib
+# mdrl/ (MetaMo-integrated deep RL) only
+torch
+pytest
