@@ -1,14 +1,24 @@
 from abc import ABC, abstractmethod
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, List, Mapping, Optional, Tuple
 import numpy as np
 
 from core.state import MotivationalState, Stimulus, Action
 
+@dataclass(frozen=True)
+class AppraisalContext:
+    """Untyped observation context so learned appraisers need not couple core to an environment schema."""
+
+    observation: Optional[Any] = None
+    curiosity_features: Optional[Any] = None
+    learning: bool = False
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
 class AppraisalComonad(ABC):
     """
     Abstract base class for the Appraisal Comonad (\Psi).
-    In MetaMo, the comonad handles stimulus appraisal, updating affect and modulators[cite: 28, 307].
-    It maps the state and a stimulus to a new state: \Psi(X \times S) -> X[cite: 314].
+    In MetaMo, the comonad handles stimulus appraisal, updating affect and modulators.
+    It maps the state and a stimulus to a new state: \Psi(X \times S) -> X.
     """
 
     @abstractmethod
@@ -23,16 +33,28 @@ class AppraisalComonad(ABC):
     def appraise(self, state: MotivationalState, stimulus: Stimulus) -> MotivationalState:
         """
         The endofunctor application.
-        Updates the modulators M based on the stimulus without altering the high-level goals G[cite: 54].
-        Yields \Psi((G, M), s) = (G, M')[cite: 55, 160].
+        Updates the modulators M based on the stimulus without altering the high-level goals G.
+        Yields \Psi((G, M), s) = (G, M').
         """
         pass
 
+    def appraise_with_context(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        context: Optional[AppraisalContext] = None,
+    ) -> MotivationalState:
+        """Appraise with optional integration context.
+
+        This backward-compatible default preserves every existing appraiser:
+        context-free implementations continue to implement only ``appraise``.
+        """
+        return self.appraise(state, stimulus)
 
 class DecisionMonad(ABC):
     """
     Abstract base class for the Decision Monad (\mathbb{D}).
-    In MetaMo, the monad handles goal selection and action scoring[cite: 28, 307].
+    In MetaMo, the monad handles goal selection and action scoring.
     It maps the state to a new goal configuration: \mathbb{D}(X).
     """
 
@@ -46,16 +68,46 @@ class DecisionMonad(ABC):
 
     @abstractmethod
     def decide(self, state: MotivationalState, candidates: List[Action]) -> Tuple[Action, np.ndarray]:
-        """
-        The endofunctor application.
-        Scores each candidate action under the updated goals and modulators[cite: 315].
-        Returns the chosen action and the proposed goal update \Delta G[cite: 120, 169].
-        The composite operator F = D \circ \Psi is responsible for turning this proposal into
-        the finalized next motivational state.
-        """
+        """Score candidates and return the chosen action plus the proposed goal update."""
         pass
 
-    # Add to category/functors.py
+    def decide_with_context(
+        self,
+        state: MotivationalState,
+        candidates: List[Action],
+        context: Optional[Any] = None,
+    ) -> Tuple[Action, np.ndarray]:
+        """Choose an action with optional integration-specific context.
+
+        The default preserves existing decision monads by delegating to their
+        context-free ``decide`` implementation.
+        """
+        return self.decide(state, candidates)
+
+    def evaluate_candidates(
+        self,
+        state: MotivationalState,
+        candidates: List[Action],
+        context: Optional[Any] = None,
+    ) -> np.ndarray:
+        """Score candidates without selecting one. Learned monads may require a typed context."""
+        scorer = getattr(self, "score_candidate", None)
+        if scorer is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement candidate evaluation"
+            )
+        return np.asarray([scorer(state, candidate) for candidate in candidates])
+
+    def goal_update_for_candidate(
+        self,
+        state: MotivationalState,
+        candidate: Action,
+        index: int,
+        context: Optional[Any] = None,
+    ) -> np.ndarray:
+        """Return the deterministic goal proposal associated with a candidate."""
+        return candidate.delta_g.copy()
+
 class TranslationFunctor:
     """
     Implements Principle 2: Reciprocal Motivational State Simulation.

@@ -1,6 +1,6 @@
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple
 import numpy as np
-# Assuming these are available in your python path
 from core.state import MotivationalState, Stimulus, Action
 from core.config import (
     G_ETHIC,
@@ -12,6 +12,8 @@ from core.config import (
     G_SOC,
     G_TRANS,
     G_CURIO,
+    C_CONTRACT,
+    EPSILON,
     M_APPROACH,
     M_AROUSAL,
     M_RESOLUTION,
@@ -19,61 +21,183 @@ from core.config import (
     M_THRESHOLD,
     M_VALENCE,
     )
-from category.functors import AppraisalComonad, DecisionMonad
+from category.functors import AppraisalComonad, AppraisalContext, DecisionMonad
 from dynamics.stability import (
-    apply_homeostatic_damping,
-    check_contractive_update_law,
+    StabilizationPolicy,
+    StabilizationResult,
     is_in_safe_region,
+    is_in_boundary_band,
     project_to_safe_region,
     raise_boundary_caution,
+    MetaMoStabilizationPolicy,
+    stabilize_goal_update,
 )
+from dynamics.coherence import blend_states
+
+DecisionContextFactory = Callable[[MotivationalState], Any]
+
+@dataclass(frozen=True)
+class DecisionResult:
+    """One selected candidate and its proposed goal update."""
+
+    action: Action
+    proposed_delta_g: np.ndarray
+
+@dataclass(frozen=True)
+class TransitionValidation:
+    """Side-effect-free runtime validation of one MetaMo transition."""
+
+    lax_distributive_error: float
+    lax_distributive_passed: bool
+    contraction_ratio: Optional[float]
+    contractivity_passed: bool
+    safety_passed: bool
+    fallback_reasons: Tuple[str, ...] = ()
+
+@dataclass(frozen=True)
+class RuntimeValidationPolicy:
+    """Controls validation and conservative fallback explicitly."""
+
+    enabled: bool = True
+    fallback_on_failure: bool = True
+
+@dataclass(frozen=True)
+class MetaMoTransitionResult:
+    """Structured result of appraisal, decision, stabilization, and validation."""
+
+    previous_state: MotivationalState
+    appraised_state: MotivationalState
+    decision: DecisionResult
+    stabilization: StabilizationResult
+    next_state: MotivationalState
+    validation: TransitionValidation
+
+@dataclass(frozen=True)
+class ConsensusTransitionResult:
+    """Structured two-perspective consensus transition."""
+
+    action: Action
+    perspective_a_target: MotivationalState
+    perspective_b_target: MotivationalState
+    merged_target: MotivationalState
+    projected_target: MotivationalState
+    next_state: MotivationalState
 
 class MetaMoPseudoBimonad:
     """
     Represents the composite appraisal-then-decision operator F = D \circ \Psi.
-    This forms a pseudo-bimonad on the motivational state space X = G \times M[cite: 28, 309].
+    This forms a pseudo-bimonad on the motivational state space X = G \times M.
     """
-    def __init__(self, appraisal: AppraisalComonad, decision: DecisionMonad):
+    def __init__(
+        self,
+        appraisal: AppraisalComonad,
+        decision: DecisionMonad,
+        stabilization_policy: Optional[StabilizationPolicy] = None,
+        validation_policy: Optional[RuntimeValidationPolicy] = None,
+    ):
         self.appraisal = appraisal
         self.decision = decision
-
-    def _compute_transition(self, state: MotivationalState, stimulus: Stimulus, candidates: List[Action]) -> Tuple[Action, MotivationalState]:
-        """
-        Compute one appraisal/decision transition before runtime validation.
-        """
-        # 1. Appraise (\Psi) - Update modulators based on stimulus[cite: 314].
-        appraised_state = self.appraisal.appraise(state, stimulus)
-        appraised_state = raise_boundary_caution(appraised_state)
-        
-        # 2. Decide (\mathbb{D}) - Score candidates and update goals[cite: 315].
-        chosen_action, proposed_delta_g = self.decision.decide(appraised_state, candidates)
-
-        damped_delta_g = apply_homeostatic_damping(appraised_state, proposed_delta_g)
-        next_state = MotivationalState(
-            G=np.clip(appraised_state.G + damped_delta_g, 0.0, 1.0),
-            M=appraised_state.M.copy(),
+        # Default is no blending. Callers opt in with MetaMoStabilizationPolicy(blend=True).
+        self.stabilization_policy = stabilization_policy or MetaMoStabilizationPolicy(
+            blend=False
         )
-        next_state = project_to_safe_region(next_state)
-        
-        return chosen_action, next_state
+        self.validation_policy = validation_policy or RuntimeValidationPolicy()
+
+    def appraise(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        context: Optional[AppraisalContext] = None,
+    ) -> MotivationalState:
+        """Apply Psi and canonical boundary-sensitive caution."""
+        appraised = self.appraisal.appraise_with_context(state, stimulus, context)
+        if not self.stabilization_policy.enabled:
+            return appraised
+        return raise_boundary_caution(appraised)
+
+    def decide(
+        self,
+        appraised_state: MotivationalState,
+        candidates: List[Action],
+        context: Optional[Any] = None,
+    ) -> DecisionResult:
+        """Select one candidate, allowing the policy to consume RNG."""
+        action, proposed_delta_g = self.decision.decide_with_context(
+            appraised_state, candidates, context
+        )
+        return DecisionResult(action, np.asarray(proposed_delta_g, dtype=float))
+
+    def evaluate_decision(
+        self,
+        decision_state: MotivationalState,
+        candidates: List[Action],
+        context: Optional[Any] = None,
+    ) -> DecisionResult:
+        """Greedily evaluate a decision without exploration or RNG mutation."""
+        scores = self.decision.evaluate_candidates(
+            decision_state, candidates, context
+        )
+        if len(scores) != len(candidates) or not candidates:
+            raise ValueError("candidate evaluation must return one score per candidate")
+        index = int(np.argmax(scores))
+        action = candidates[index]
+        proposed_delta_g = self.decision.goal_update_for_candidate(
+            decision_state, action, index, context
+        )
+        return DecisionResult(action, np.asarray(proposed_delta_g, dtype=float))
+
+    def stabilize(
+        self,
+        previous_state: MotivationalState,
+        appraised_state: MotivationalState,
+        proposed_delta_g: np.ndarray,
+        policy: Optional[StabilizationPolicy] = None,
+    ) -> StabilizationResult:
+        """Apply the canonical stabilization operation configured for this cycle."""
+        return stabilize_goal_update(
+            previous_state=previous_state,
+            appraised_state=appraised_state,
+            proposed_delta_g=proposed_delta_g,
+            policy=policy or self.stabilization_policy,
+        )
+
+    def _compute_transition(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context: Optional[Any] = None,
+    ) -> Tuple[Action, MotivationalState]:
+        """Compatibility helper: compute a transition without validation."""
+        appraised_state = self.appraise(state, stimulus, appraisal_context)
+        decision = self.decide(appraised_state, candidates, decision_context)
+        stabilization = self.stabilize(
+            state, appraised_state, decision.proposed_delta_g
+        )
+        return decision.action, stabilization.final_state
 
     def _state_from_delta(self, decision_state: MotivationalState, proposed_delta_g: np.ndarray) -> MotivationalState:
         """
         Apply a proposed goal update inside the same stabilization path used by the main transition.
         """
-        damped_delta_g = apply_homeostatic_damping(decision_state, proposed_delta_g)
-        next_state = MotivationalState(
-            G=np.clip(decision_state.G + damped_delta_g, 0.0, 1.0),
-            M=decision_state.M.copy(),
+        stabilization = self.stabilize(
+            previous_state=decision_state,
+            appraised_state=decision_state,
+            proposed_delta_g=proposed_delta_g,
         )
-        return project_to_safe_region(next_state)
+        return stabilization.final_state
 
-    def _decision_context(self, state: MotivationalState, stimulus: Stimulus) -> MotivationalState:
+    def _decision_context(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        appraisal_context: Optional[AppraisalContext] = None,
+    ) -> MotivationalState:
         """
         Build the post-appraisal state that the decision monad should score.
         """
-        appraised_state = self.appraisal.appraise(state, stimulus)
-        return raise_boundary_caution(appraised_state)
+        return self.appraise(state, stimulus, appraisal_context)
 
     def _local_reference_state(self, state: MotivationalState, next_state: MotivationalState) -> MotivationalState:
         """
@@ -96,31 +220,30 @@ class MetaMoPseudoBimonad:
         state_b: MotivationalState,
         stimulus: Stimulus,
         candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
     ) -> Action:
         """
         Select a shared action by combining the two subsystem evaluations over the same candidate set.
         """
-        if not hasattr(self.decision, "score_candidate"):
-            raise TypeError("decision monad must provide score_candidate for consensus action selection")
+        scores = self.consensus_scores(
+            state_a, state_b, stimulus, candidates, appraisal_context
+        )
+        return candidates[int(np.argmax(scores))]
 
-        context_a = self._decision_context(state_a, stimulus)
-        context_b = self._decision_context(state_b, stimulus)
-
-        best_action = None
-        best_score = -float("inf")
-
-        for candidate in candidates:
-            score_a = self.decision.score_candidate(context_a, candidate)
-            score_b = self.decision.score_candidate(context_b, candidate)
-            mean_score = (score_a + score_b) / 2.0
-            disagreement_penalty = 0.25 * abs(score_a - score_b)
-            consensus_score = mean_score - disagreement_penalty
-
-            if consensus_score > best_score:
-                best_score = consensus_score
-                best_action = candidate
-
-        return best_action
+    def consensus_scores(
+        self,
+        state_a: MotivationalState,
+        state_b: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+    ) -> np.ndarray:
+        """Return mean perspective scores with a disagreement penalty."""
+        context_a = self.appraise(state_a, stimulus, appraisal_context)
+        context_b = self.appraise(state_b, stimulus, appraisal_context)
+        scores_a = self.decision.evaluate_candidates(context_a, candidates)
+        scores_b = self.decision.evaluate_candidates(context_b, candidates)
+        return (scores_a + scores_b) / 2.0 - 0.25 * np.abs(scores_a - scores_b)
 
     def consensus_transition(
         self,
@@ -128,17 +251,59 @@ class MetaMoPseudoBimonad:
         state_b: MotivationalState,
         stimulus: Stimulus,
         candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
     ) -> Tuple[Action, MotivationalState]:
         """
         Build a coupled consensus action and consensus target state from the same shared candidate set.
         """
-        action = self.consensus_action(state_a, state_b, stimulus, candidates)
-        context_a = self._decision_context(state_a, stimulus)
-        context_b = self._decision_context(state_b, stimulus)
+        action, _, _, merged_target = self._consensus_targets(
+            state_a, state_b, stimulus, candidates, appraisal_context
+        )
+        return action, merged_target
+
+    def _consensus_targets(
+        self,
+        state_a: MotivationalState,
+        state_b: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+    ) -> Tuple[
+        Action, MotivationalState, MotivationalState, MotivationalState
+    ]:
+        """Build the two stabilized perspective targets and merge them."""
+        action = self.consensus_action(
+            state_a, state_b, stimulus, candidates, appraisal_context
+        )
+        context_a = self.appraise(state_a, stimulus, appraisal_context)
+        context_b = self.appraise(state_b, stimulus, appraisal_context)
         target_a = self._state_from_delta(context_a, action.delta_g)
         target_b = self._state_from_delta(context_b, action.delta_g)
-        merged_target = self.parallel_merge(target_a, target_b)
-        return action, merged_target
+        return action, target_a, target_b, self.parallel_merge(target_a, target_b)
+
+    def complete_consensus_transition(
+        self,
+        previous_state: MotivationalState,
+        state_a: MotivationalState,
+        state_b: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+    ) -> ConsensusTransitionResult:
+        """Project and blend a consensus target. ``consensus_transition`` still returns the unprojected merge."""
+        action, target_a, target_b, merged_target = self._consensus_targets(
+            state_a, state_b, stimulus, candidates, appraisal_context
+        )
+        projected_target = project_to_safe_region(merged_target)
+        next_state = blend_states(previous_state, projected_target)
+        return ConsensusTransitionResult(
+            action=action,
+            perspective_a_target=target_a,
+            perspective_b_target=target_b,
+            merged_target=merged_target,
+            projected_target=projected_target,
+            next_state=next_state,
+        )
 
     def _apply_conservative_fallback(self, current_state: MotivationalState, next_state: MotivationalState) -> MotivationalState:
         """
@@ -150,55 +315,232 @@ class MetaMoPseudoBimonad:
         )
         return project_to_safe_region(fallback_state)
 
+    @staticmethod
+    def _context_for(
+        state: MotivationalState,
+        factory: Optional[DecisionContextFactory],
+    ) -> Optional[Any]:
+        return None if factory is None else factory(state)
+
+    def _deterministic_transition(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context_factory: Optional[DecisionContextFactory] = None,
+    ) -> MotivationalState:
+        appraised = self.appraise(state, stimulus, appraisal_context)
+        context = self._context_for(appraised, decision_context_factory)
+        decision = self.evaluate_decision(appraised, candidates, context)
+        return self.stabilize(
+            state, appraised, decision.proposed_delta_g
+        ).final_state
+
+    def lax_distributive_error(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context_factory: Optional[DecisionContextFactory] = None,
+    ) -> float:
+        """Measure the two deterministic appraisal/decision orderings."""
+        decision_state_1 = self.appraise(state, stimulus, appraisal_context)
+        context_1 = self._context_for(decision_state_1, decision_context_factory)
+        decision_1 = self.evaluate_decision(
+            decision_state_1, candidates, context_1
+        )
+        final_state_1 = self.stabilize(
+            decision_state_1,
+            decision_state_1,
+            decision_1.proposed_delta_g,
+        ).final_state
+
+        context_2 = self._context_for(state, decision_context_factory)
+        decision_2 = self.evaluate_decision(state, candidates, context_2)
+        decided_state_2 = self.stabilize(
+            state, state, decision_2.proposed_delta_g
+        ).final_state
+        final_state_2 = self.appraise(
+            decided_state_2, stimulus, appraisal_context
+        )
+        return float(final_state_1.distance_to(final_state_2))
+
+    def contractivity_ratio(
+        self,
+        state: MotivationalState,
+        reference_state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context_factory: Optional[DecisionContextFactory] = None,
+    ) -> Optional[float]:
+        """Return deterministic d(F(x), F(y)) / d(x, y) near the boundary."""
+        if not (
+            is_in_boundary_band(state) or is_in_boundary_band(reference_state)
+        ):
+            return None
+        initial_distance = state.distance_to(reference_state)
+        if initial_distance <= 1e-12:
+            return None
+        next_state = self._deterministic_transition(
+            state,
+            stimulus,
+            candidates,
+            appraisal_context,
+            decision_context_factory,
+        )
+        next_reference = self._deterministic_transition(
+            reference_state,
+            stimulus,
+            candidates,
+            appraisal_context,
+            decision_context_factory,
+        )
+        return float(next_state.distance_to(next_reference) / initial_distance)
+
+    def complete_transition(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraised_state: MotivationalState,
+        decision: DecisionResult,
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context_factory: Optional[DecisionContextFactory] = None,
+        validation_policy: Optional[RuntimeValidationPolicy] = None,
+    ) -> MetaMoTransitionResult:
+        """Stabilize and validate an already appraised and selected cycle."""
+        policy = validation_policy or self.validation_policy
+        stabilization = self.stabilize(
+            state, appraised_state, decision.proposed_delta_g
+        )
+        next_state = stabilization.final_state
+
+        lax_error = 0.0
+        lax_passed = True
+        contraction_ratio = None
+        contractivity_passed = True
+        safety_passed = is_in_safe_region(next_state)
+        fallback_reasons = []
+
+        if policy.enabled:
+            lax_error = self.lax_distributive_error(
+                state,
+                stimulus,
+                candidates,
+                appraisal_context,
+                decision_context_factory,
+            )
+            lax_passed = lax_error <= LAX_DISTRIBUTIVE_DELTA
+            if not lax_passed:
+                fallback_reasons.append("lax_distributive")
+                if policy.fallback_on_failure:
+                    next_state = self._apply_conservative_fallback(state, next_state)
+
+            reference_state = self._local_reference_state(
+                state, stabilization.final_state
+            )
+            contraction_ratio = self.contractivity_ratio(
+                state,
+                reference_state,
+                stimulus,
+                candidates,
+                appraisal_context,
+                decision_context_factory,
+            )
+            if contraction_ratio is not None:
+                initial_distance = state.distance_to(reference_state)
+                contractivity_passed = (
+                    contraction_ratio * initial_distance
+                    <= C_CONTRACT * initial_distance + EPSILON
+                )
+            if not contractivity_passed:
+                fallback_reasons.append("contractivity")
+                if policy.fallback_on_failure:
+                    next_state = self._apply_conservative_fallback(state, next_state)
+
+            safety_passed = is_in_safe_region(next_state)
+            if not safety_passed:
+                fallback_reasons.append("safe_region")
+                if policy.fallback_on_failure:
+                    next_state = self._apply_conservative_fallback(state, next_state)
+
+        validation = TransitionValidation(
+            lax_distributive_error=lax_error,
+            lax_distributive_passed=lax_passed,
+            contraction_ratio=contraction_ratio,
+            contractivity_passed=contractivity_passed,
+            safety_passed=safety_passed,
+            fallback_reasons=tuple(fallback_reasons),
+        )
+        return MetaMoTransitionResult(
+            previous_state=state,
+            appraised_state=appraised_state,
+            decision=decision,
+            stabilization=stabilization,
+            next_state=next_state,
+            validation=validation,
+        )
+
+    def transition(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+        decision_context: Optional[Any] = None,
+        decision_context_factory: Optional[DecisionContextFactory] = None,
+        validation_policy: Optional[RuntimeValidationPolicy] = None,
+    ) -> MetaMoTransitionResult:
+        """Execute a complete MetaMo cycle and expose every intermediate."""
+        appraised = self.appraise(state, stimulus, appraisal_context)
+        decision = self.decide(appraised, candidates, decision_context)
+        return self.complete_transition(
+            state=state,
+            stimulus=stimulus,
+            candidates=candidates,
+            appraised_state=appraised,
+            decision=decision,
+            appraisal_context=appraisal_context,
+            decision_context_factory=decision_context_factory,
+            validation_policy=validation_policy,
+        )
+
     def step(
         self,
         state: MotivationalState,
         stimulus: Stimulus,
         candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
     ) -> Tuple[Action, MotivationalState]:
-        """
-        Executes one full cycle of F = D \circ \Psi.
-        This governs the motivational coalgebra \alpha: X \to F(X)[cite: 310, 316].
-        """
-        chosen_action, next_state = self._compute_transition(state, stimulus, candidates)
-        reference_state = self._local_reference_state(state, next_state)
-        if not self.check_lax_distributive_law(state, stimulus, candidates):
-            next_state = self._apply_conservative_fallback(state, next_state)
-        if not check_contractive_update_law(self, state, reference_state, stimulus, candidates):
-            next_state = self._apply_conservative_fallback(state, next_state)
-        if not is_in_safe_region(next_state):
-            next_state = self._apply_conservative_fallback(state, next_state)
-        return chosen_action, next_state
+        """Compatibility wrapper returning the original tuple API."""
+        result = self.transition(
+            state,
+            stimulus,
+            candidates,
+            appraisal_context=appraisal_context,
+        )
+        return result.decision.action, result.next_state
 
-    def check_lax_distributive_law(self, state: MotivationalState, stimulus: Stimulus, candidates: List[Action]) -> bool:
-        """
-        Validates the First Principle: Modular Appraisal-Decision Interface[cite: 287, 322].
-        Checks that \lambda_X : \Psi(\mathbb{D}(X)) \Rightarrow \mathbb{D}(\Psi(X)) commutes up to a controlled error[cite: 308].
-        """
-        # Path 1: Appraise then Decide -> stabilized D(Psi(X))
-        decision_state_1 = self._decision_context(state, stimulus)
-        action_1, delta_g_1 = self.decision.decide(decision_state_1, candidates)
-        final_state_1 = self._state_from_delta(decision_state_1, delta_g_1)
-        
-        # Path 2: Decide then Appraise -> stabilized Psi(D(X))
-        action_2, delta_g_2 = self.decision.decide(state, candidates)
-        decided_state_2 = self._state_from_delta(state, delta_g_2)
-        final_state_2 = self._decision_context(decided_state_2, stimulus)
-        
-        # Calculate the controlled distortion distance[cite: 332, 344].
-        distortion = final_state_1.distance_to(final_state_2)
-        
-        # The law holds if the distortion is bounded by the acceptable delta[cite: 344].
-        return distortion <= LAX_DISTRIBUTIVE_DELTA
+    def check_lax_distributive_law(
+        self,
+        state: MotivationalState,
+        stimulus: Stimulus,
+        candidates: List[Action],
+        appraisal_context: Optional[AppraisalContext] = None,
+    ) -> bool:
+        """Backward-compatible Boolean wrapper around the measured error."""
+        return (
+            self.lax_distributive_error(
+                state, stimulus, candidates, appraisal_context
+            )
+            <= LAX_DISTRIBUTIVE_DELTA
+        )
     
     def parallel_merge(self, state_a: MotivationalState, state_b: MotivationalState, coherence_correction: float = 0.05) -> MotivationalState:
-        """
-        Implements Principle 3: Parallel Motivational Compositionality.
-        Witnesses the lax-monoidal structure \phi_{X,Y} of the composite F.
-        Merges two parallel motivational subsystems with dimension-wise coherence corrections.
-        Safety-relevant disagreements are merged conservatively, while exploratory disagreements
-        are damped unless both subsystems support them.
-        """
+        """Merge two motivational states, conservatively on safety and damped on exploration."""
         weight_a = state_a.G[G_IND]
         weight_b = state_b.G[G_IND]
         total_weight = weight_a + weight_b + 1e-9
@@ -212,26 +554,26 @@ class MetaMoPseudoBimonad:
         consensus_G = base_G.copy()
         consensus_M = base_M.copy()
 
-        # Safety-critical dimensions preserve the stronger caution/ethics signal under disagreement.
+        # Safety dimensions keep the stronger caution signal.
         safety_goal_idx = np.array([G_IND, G_HELP, G_ETHIC])
         consensus_G[safety_goal_idx] = np.maximum(state_a.G[safety_goal_idx], state_b.G[safety_goal_idx])
 
-        # Exploratory dimensions require stronger agreement; otherwise they are damped toward the shared floor.
+        # Exploratory dimensions keep the weaker signal unless both agree.
         exploratory_goal_idx = np.array([G_TRANS, G_CURIO, G_NOVEL, G_SELF])
         consensus_G[exploratory_goal_idx] = np.minimum(state_a.G[exploratory_goal_idx], state_b.G[exploratory_goal_idx])
 
-        # Social engagement is shared but should not outrun subsystem agreement.
+        # Social engagement cannot exceed either subsystem.
         consensus_G[G_SOC] = min(base_G[G_SOC], state_a.G[G_SOC], state_b.G[G_SOC])
 
-        # Caution modulators preserve the higher warning signal.
+        # Caution modulators keep the higher warning.
         caution_mod_idx = np.array([M_THRESHOLD, M_SECURING])
         consensus_M[caution_mod_idx] = np.maximum(state_a.M[caution_mod_idx], state_b.M[caution_mod_idx])
 
-        # Exploratory modulators are damped unless both subsystems align.
+        # Exploratory modulators keep the lower value.
         exploratory_mod_idx = np.array([M_AROUSAL, M_APPROACH])
         consensus_M[exploratory_mod_idx] = np.minimum(state_a.M[exploratory_mod_idx], state_b.M[exploratory_mod_idx])
 
-        # Valence/resolution remain closer to the weighted consensus.
+        # Valence and resolution stay near the weighted average.
         shared_mod_idx = np.array([M_VALENCE, M_RESOLUTION])
         consensus_M[shared_mod_idx] = (
             (state_a.M[shared_mod_idx] + state_b.M[shared_mod_idx]) / 2.0

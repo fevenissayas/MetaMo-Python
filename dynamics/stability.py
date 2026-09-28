@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Protocol
+
 import numpy as np
-from typing import List
 from core.state import MotivationalState
 from core.config import (
     G_IND, 
@@ -13,10 +17,55 @@ from core.config import (
 )
 from core.state import Stimulus, Action
 
+if TYPE_CHECKING:
+    from category.functors import AppraisalContext
+
+class StabilizationPolicy(Protocol):
+    """Configuration for applying a proposed MetaMo goal update."""
+
+    enabled: bool
+    blend: bool
+
+@dataclass(frozen=True)
+class MetaMoStabilizationPolicy:
+    """Canonical damping and projection, optionally followed by blending."""
+
+    blend: bool = True
+    enabled: ClassVar[bool] = True
+
+@dataclass(frozen=True)
+class NoStabilizationPolicy:
+    """Ablation policy that applies the clipped raw proposal unchanged."""
+
+    enabled: ClassVar[bool] = False
+    blend: ClassVar[bool] = False
+
+@dataclass(frozen=True)
+class StabilizationResult:
+    """All intermediate states produced while stabilizing one goal update.
+
+    Keeping these values together lets applications report projection and
+    safety diagnostics without reimplementing the MetaMo transition equations.
+    """
+
+    raw_delta_g: np.ndarray
+    damped_delta_g: np.ndarray
+    raw_state: MotivationalState
+    target_state: MotivationalState
+    projected_state: MotivationalState
+    final_state: MotivationalState
+    accepted_delta_g: np.ndarray
+    pre_projection_safe: bool
+    post_projection_safe: bool
+    projection_magnitude: float
+    boundary_pressure: float
+    self_model_drift: float
+    blend_alpha: float
+
 def is_in_safe_region(state: MotivationalState) -> bool:
     """
     Checks if the state is within the designated safe region R.
-    R = {(G, M) | g_over^Ind >= \theta_{safe} \wedge ||G|| <= G_{max}}[cite: 131, 174].
+    R = {(G, M) | g_over^Ind >= \theta_{safe} \wedge ||G|| <= G_{max}}.
     """
     g_ind = state.G[G_IND]
     g_norm = np.linalg.norm(state.G)
@@ -42,23 +91,18 @@ def distance_to_unsafe_boundary(state: MotivationalState) -> float:
     Approximates the distance from the current state to the edge of the safe region (\partial R).
     Calculates how close the agent is to violating THETA_SAFE or G_MAX.
     """
-    # Distance to the individuation safety floor
     dist_to_theta = max(0.0, state.G[G_IND] - THETA_SAFE)
-    
-    # Distance to the maximum goal norm ceiling
     g_norm = np.linalg.norm(state.G)
     dist_to_g_max = max(0.0, G_MAX - g_norm)
-    
-    # The actual distance to the boundary is determined by whichever constraint is closer
     return min(dist_to_theta, dist_to_g_max)
 
 def is_in_boundary_band(state: MotivationalState) -> bool:
     """
     Checks if the state is in the boundary band B_\eta.
-    B_\eta = {x \in R | dist(x, X \setminus R) <= \eta}[cite: 383].
+    B_\eta = {x \in R | dist(x, X \setminus R) <= \eta}.
     """
     if not is_in_safe_region(state):
-        return False # It is already outside the safe region entirely
+        return False
         
     dist_to_boundary = distance_to_unsafe_boundary(state)
     return dist_to_boundary <= ETA_BOUNDARY
@@ -83,30 +127,24 @@ def check_contractive_update_law(
     x: MotivationalState, 
     y: MotivationalState, 
     stimulus: Stimulus,
-    candidates: List[Action]
+    candidates: List[Action],
+    appraisal_context: Optional[AppraisalContext] = None,
 ) -> bool:
-    """
-    Validates that the pseudo-bimonad update F = D \circ \Psi is contractive near the boundary.
-    Requirement: d(F(x), F(y)) <= c * d(x,y) + \epsilon where c < 1[cite: 132, 176, 384].
-    This ensures that high individuation near the boundary induces contraction toward safety[cite: 133].
-    """
-    # If neither state is in the boundary band, the contractivity constraint relaxes[cite: 134, 385].
+    """Check that the pseudo-bimonad update is contractive near the safe-region boundary."""
     if not (is_in_boundary_band(x) or is_in_boundary_band(y)):
-        return True # Dynamics are allowed to be flexible deep inside R[cite: 385, 403].
+        return True
 
-    # Calculate initial distance d(x, y)
     dist_initial = x.distance_to(y)
-    
-    # Apply the F operator to both states
-    _, F_x = bimonad._compute_transition(x, stimulus, candidates)
-    _, F_y = bimonad._compute_transition(y, stimulus, candidates)
-    
-    # Calculate final distance d(F(x), F(y))
-    dist_final = F_x.distance_to(F_y)
-    
-    # Verify the contractive bound
-    return dist_final <= (C_CONTRACT * dist_initial) + EPSILON
-
+    ratio = bimonad.contractivity_ratio(
+        x,
+        y,
+        stimulus,
+        candidates,
+        appraisal_context=appraisal_context,
+    )
+    if ratio is None:
+        return True
+    return (ratio * dist_initial) <= (C_CONTRACT * dist_initial) + EPSILON
 
 def apply_homeostatic_damping(state: MotivationalState, delta_g: np.ndarray) -> np.ndarray:
     """
@@ -116,10 +154,8 @@ def apply_homeostatic_damping(state: MotivationalState, delta_g: np.ndarray) -> 
     if pressure == 0.0:
         return delta_g
 
-    # Stronger boundary pressure and higher individuation induce more contraction.
     damping_factor = max(0.0, 1.0 - (pressure * state.G[G_IND]))
     return delta_g * damping_factor
-
 
 def project_to_safe_region(state: MotivationalState) -> MotivationalState:
     """
@@ -139,3 +175,71 @@ def project_to_safe_region(state: MotivationalState) -> MotivationalState:
     next_state.M[M_SECURING] = min(1.0, next_state.M[M_SECURING] + 0.1)
     next_state.M[M_THRESHOLD] = min(1.0, next_state.M[M_THRESHOLD] + 0.1)
     return next_state
+
+def stabilize_goal_update(
+    previous_state: MotivationalState,
+    appraised_state: MotivationalState,
+    proposed_delta_g: np.ndarray,
+    policy: Optional[StabilizationPolicy] = None,
+) -> StabilizationResult:
+    """Damp, project, and optionally blend one goal update. ``raw_state`` is the unstabilized proposal."""
+    from dynamics.coherence import blend_states, calculate_blend_factor
+
+    policy = policy or MetaMoStabilizationPolicy()
+    raw_delta_g = np.asarray(proposed_delta_g, dtype=float)
+    raw_state = MotivationalState(
+        G=np.clip(appraised_state.G + raw_delta_g, 0.0, 1.0),
+        M=appraised_state.M.copy(),
+    )
+    pre_projection_safe = is_in_safe_region(raw_state)
+
+    if not policy.enabled:
+        final_state = raw_state
+        return StabilizationResult(
+            raw_delta_g=raw_delta_g,
+            damped_delta_g=raw_delta_g.copy(),
+            raw_state=raw_state,
+            target_state=raw_state,
+            projected_state=raw_state,
+            final_state=final_state,
+            accepted_delta_g=final_state.G - appraised_state.G,
+            pre_projection_safe=pre_projection_safe,
+            post_projection_safe=is_in_safe_region(final_state),
+            projection_magnitude=0.0,
+            boundary_pressure=boundary_pressure(final_state),
+            self_model_drift=previous_state.distance_to(final_state),
+            blend_alpha=1.0,
+        )
+
+    damped_delta_g = apply_homeostatic_damping(appraised_state, raw_delta_g)
+    target_state = MotivationalState(
+        G=np.clip(appraised_state.G + damped_delta_g, 0.0, 1.0),
+        M=appraised_state.M.copy(),
+    )
+    projected_state = project_to_safe_region(target_state)
+    projection_magnitude = float(
+        np.linalg.norm(target_state.G - projected_state.G)
+    )
+
+    if policy.blend:
+        final_state = blend_states(previous_state, projected_state)
+        blend_alpha = calculate_blend_factor(previous_state)
+    else:
+        final_state = projected_state
+        blend_alpha = 1.0
+
+    return StabilizationResult(
+        raw_delta_g=raw_delta_g,
+        damped_delta_g=damped_delta_g,
+        raw_state=raw_state,
+        target_state=target_state,
+        projected_state=projected_state,
+        final_state=final_state,
+        accepted_delta_g=final_state.G - previous_state.G,
+        pre_projection_safe=pre_projection_safe,
+        post_projection_safe=is_in_safe_region(final_state),
+        projection_magnitude=projection_magnitude,
+        boundary_pressure=boundary_pressure(final_state),
+        self_model_drift=previous_state.distance_to(final_state),
+        blend_alpha=float(blend_alpha),
+    )
