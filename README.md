@@ -93,6 +93,23 @@ MetaMo-Python/
 |   |-- plot/                     # Generated evaluation plots (created at runtime)
 |   |-- INTEGRATION.md            # GridWorld integration documentation
 |
+|-- mdrl/                         # MetaMo-integrated deep RL (see mdrl/README.md)
+|   |-- config.py                 # ConditionSpec, TrainingConfig, vector outcome schema
+|   |-- types.py                  # Candidate, Certificate, DecisionContext, Transition
+|   |-- agent.py                  # Section 5.4 loop: Double DQN with SMDP targets
+|   |-- stabilizer.py             # Damping, projection, blending, stability diagnostics
+|   |-- metrics.py                # Section 7.6 metrics and counterfactual probes
+|   |-- envs/                     # CuriousGridWorld: routes, zones, energy, interventions
+|   |-- candidates/               # Descriptors, skills as options, SubRep adapter
+|   |-- curiosity/                # World model, error model, LP estimators and baselines
+|   |-- nets/                     # Candidate-conditioned and fixed-output Q networks
+|   |-- decision/                 # Preference map w_t/beta_t, DQN decision monad
+|   |-- replay/                   # Motive-stratified replay, preference relabeling
+|   |-- appraisal/                # Bounded learned appraisal residual
+|   |-- bench/                    # Conditions, protocol, runner, statistics, report
+|   |-- tests/                    # Invariants the benchmark's conclusions rest on
+|
+|-- run_mdrl_bench.py             # Benchmark entry point
 |-- setup.sh                      # Setup script for Linux/macOS
 |-- setup.ps1                     # Setup script for Windows
 |-- .env.example                  # Environment variable template
@@ -169,6 +186,25 @@ python applications/research_assistant.py
 ```
 
 This runs a simulation demonstrating a MetaMo-powered curious research assistant that evaluates stimuli and selects actions based on its motivational state.
+
+## MetaMo-integrated deep reinforcement learning
+
+The `mdrl/` package implements *A MetaMo-integrated Deep Reinforcement Learning*,
+which inserts a learned decision process at MetaMo's decision seam while leaving
+appraisal, the goal-update calculator, and the stability machinery in place.
+It ships a benchmark over 24 conditions, including a faithful Pathak ICM
+curiosity ablation alongside the learning-progress estimators and other baselines,
+three seed-matched staged residual-appraisal conditions, and ten transfer regimes.
+
+```bash
+python run_mdrl_bench.py --conditions smoke --seeds 3      # a few minutes
+python run_mdrl_bench.py --conditions all --seeds 5 --workers 7
+python -m pytest mdrl/tests -q
+```
+
+See [mdrl/README.md](mdrl/README.md) for the condition table, the evaluation
+protocol, and notes on how to read the reported metrics. This layer requires
+PyTorch; matplotlib is optional and only affects the figures.
 
 ## Key Parameters
 
