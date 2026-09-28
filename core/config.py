@@ -12,8 +12,7 @@ LAMBDA_TRANS = 0.5  # Weight of the transcendence reward (encourages growth).
 THETA_SAFE = 0.3  # Minimum required level of individuation for safety.
 G_MAX = 2.0
 
-# Contractive update law parameters for states near the boundary[cite: 132, 176].
-# d(F(x), F(y)) <= C_CONTRACT * d(x, y) + EPSILON
+# Contractivity bound near the safe-region edge: d(F(x), F(y)) <= C_CONTRACT * d(x, y) + EPSILON
 C_CONTRACT = 0.9  # Must be < 1 to ensure contractivity[cite: 132].
 EPSILON = 0.05  # Small allowed error margin[cite: 132].
 ETA_BOUNDARY = (
