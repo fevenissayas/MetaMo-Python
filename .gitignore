@@ -4,3 +4,6 @@ venv/
 .DS_Store
 .papers/
 .venv/
+results/
+__pycache__/
+*.py[cod]
